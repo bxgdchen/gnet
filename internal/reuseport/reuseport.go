@@ -1,4 +1,5 @@
-// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2020 Andy Pan
+// Copyright (c) 2017 Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,34 +19,28 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// +build linux
+// Package reuseport provides functions that return fd and net.Addr based on
+// given the protocol and address with a SO_REUSEPORT option set to the socket.
 
-package netpoll
+// +build linux freebsd dragonfly darwin
 
-import "golang.org/x/sys/unix"
+package reuseport
 
-const (
-	// InitEvents represents the initial length of poller event-list.
-	InitEvents = 128
-	// ErrEvents represents exceptional events that are not read/write, like socket being closed,
-	// reading/writing from/to a closed socket, etc.
-	ErrEvents = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
-	// OutEvents combines EPOLLOUT event and some exceptional events.
-	OutEvents = ErrEvents | unix.EPOLLOUT
-	// InEvents combines EPOLLIN/EPOLLPRI events and some exceptional events.
-	InEvents = ErrEvents | unix.EPOLLIN | unix.EPOLLPRI
+import (
+	"net"
 )
 
-type eventList struct {
-	size   int
-	events []unix.EpollEvent
+// TCPSocket calls tcpReusablePort.
+func TCPSocket(proto, addr string, reusePort bool) (int, net.Addr, error) {
+	return tcpReusablePort(proto, addr, reusePort)
 }
 
-func newEventList(size int) *eventList {
-	return &eventList{size, make([]unix.EpollEvent, size)}
+// UDPSocket calls udpReusablePort.
+func UDPSocket(proto, addr string, reusePort bool) (int, net.Addr, error) {
+	return udpReusablePort(proto, addr, reusePort)
 }
 
-func (el *eventList) increase() {
-	el.size <<= 1
-	el.events = make([]unix.EpollEvent, el.size)
+// UnixSocket calls udsReusablePort.
+func UnixSocket(proto, addr string, reusePort bool) (int, net.Addr, error) {
+	return udsReusablePort(proto, addr, reusePort)
 }

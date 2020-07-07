@@ -1,153 +1,175 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
-
-// +build windows
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
 import (
-	"io"
-	"log"
 	"net"
-	"sync/atomic"
 	"time"
 
+	"github.com/panjf2000/gnet/errors"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
 )
 
-type loop struct {
-	ch           chan interface{}  // command channel
-	idx          int               // loop index
-	svr          *server           // server in loop
-	codec        ICodec            // codec for TCP
-	connections  map[*stdConn]bool // track all the sockets bound to this loop
-	eventHandler EventHandler      // user eventHandler
+type eventloop struct {
+	ch                chan interface{}        // command channel
+	idx               int                     // loop index
+	svr               *server                 // server in loop
+	codec             ICodec                  // codec for TCP
+	connCount         int32                   // number of active connections in event-loop
+	connections       map[*stdConn]struct{}   // track all the sockets bound to this loop
+	eventHandler      EventHandler            // user eventHandler
+	calibrateCallback func(*eventloop, int32) // callback func for re-adjusting connCount
 }
 
-func (lp *loop) loopRun() {
+func (el *eventloop) loopRun() {
 	var err error
 	defer func() {
-		if lp.idx == 0 && lp.svr.opts.Ticker {
-			close(lp.svr.ticktock)
+		if el.idx == 0 && el.svr.opts.Ticker {
+			close(el.svr.ticktock)
 		}
-		lp.svr.signalShutdown(err)
-		lp.svr.loopWG.Done()
-		lp.loopEgress()
-		lp.svr.loopWG.Done()
+		el.svr.signalShutdown(err)
+		el.svr.loopWG.Done()
+		el.loopEgress()
+		el.svr.loopWG.Done()
 	}()
-	if lp.idx == 0 && lp.svr.opts.Ticker {
-		go lp.loopTicker()
+
+	if el.idx == 0 && el.svr.opts.Ticker {
+		go el.loopTicker()
 	}
-	for v := range lp.ch {
+
+	for v := range el.ch {
 		switch v := v.(type) {
 		case error:
 			err = v
 		case *stdConn:
-			err = lp.loopAccept(v)
+			err = el.loopAccept(v)
 		case *tcpIn:
-			err = lp.loopRead(v)
+			err = el.loopRead(v)
 		case *udpIn:
-			err = lp.loopReadUDP(v.c)
+			err = el.loopReadUDP(v.c)
 		case *stderr:
-			err = lp.loopError(v.c, v.err)
+			err = el.loopError(v.c, v.err)
 		case wakeReq:
-			err = lp.loopWake(v.c)
+			err = el.loopWake(v.c)
 		case func() error:
 			err = v()
 		}
 		if err != nil {
-			return
-		}
-	}
-}
-
-func (lp *loop) loopAccept(c *stdConn) error {
-	lp.connections[c] = true
-	c.localAddr = lp.svr.ln.lnaddr
-	c.remoteAddr = c.conn.RemoteAddr()
-
-	out, action := lp.eventHandler.OnOpened(c)
-	if out != nil {
-		lp.eventHandler.PreWrite()
-		_, _ = c.conn.Write(out)
-	}
-	if lp.svr.opts.TCPKeepAlive > 0 {
-		if c, ok := c.conn.(*net.TCPConn); ok {
-			_ = c.SetKeepAlive(true)
-			_ = c.SetKeepAlivePeriod(lp.svr.opts.TCPKeepAlive)
-		}
-	}
-	c.action = action
-	return lp.handleAction(c)
-}
-
-func (lp *loop) loopRead(ti *tcpIn) error {
-	c := ti.c
-	c.cache = ti.in
-loopReact:
-	out, action := lp.eventHandler.React(c)
-	if out != nil {
-		lp.eventHandler.PreWrite()
-		if frame, err := lp.codec.Encode(c, out); err == nil {
-			_, _ = c.conn.Write(frame)
-		}
-	}
-	switch c.action == action {
-	case true:
-		goto loopReact
-	case false:
-		c.action = action
-	}
-	_, _ = c.inboundBuffer.Write(c.cache.Bytes())
-	bytebuffer.Put(c.cache)
-	c.cache = nil
-	return lp.handleAction(c)
-}
-
-func (lp *loop) loopClose(c *stdConn) error {
-	atomic.StoreInt32(&c.done, 1)
-	_ = c.conn.SetReadDeadline(time.Now())
-	return nil
-}
-
-func (lp *loop) loopEgress() {
-	var closed bool
-	for v := range lp.ch {
-		switch v := v.(type) {
-		case error:
-			if v == errCloseConns {
-				closed = true
-				for c := range lp.connections {
-					_ = lp.loopClose(c)
-				}
-			}
-		case *stderr:
-			_ = lp.loopError(v.c, v.err)
-		}
-		if len(lp.connections) == 0 && closed {
+			el.svr.logger.Infof("Event-loop(%d) is exiting due to an unexpected error: %v", el.idx, err)
 			break
 		}
 	}
 }
 
-func (lp *loop) loopTicker() {
+func (el *eventloop) loopAccept(c *stdConn) error {
+	el.connections[c] = struct{}{}
+	c.localAddr = el.svr.ln.lnaddr
+	c.remoteAddr = c.conn.RemoteAddr()
+	el.calibrateCallback(el, 1)
+	if el.svr.opts.TCPKeepAlive > 0 {
+		if c, ok := c.conn.(*net.TCPConn); ok {
+			_ = c.SetKeepAlive(true)
+			_ = c.SetKeepAlivePeriod(el.svr.opts.TCPKeepAlive)
+		}
+	}
+
+	out, action := el.eventHandler.OnOpened(c)
+	if out != nil {
+		el.eventHandler.PreWrite()
+		_, _ = c.conn.Write(out)
+	}
+
+	return el.handleAction(c, action)
+}
+
+func (el *eventloop) loopRead(ti *tcpIn) (err error) {
+	c := ti.c
+	c.buffer = ti.in
+
+	for inFrame, _ := c.read(); inFrame != nil; inFrame, _ = c.read() {
+		out, action := el.eventHandler.React(inFrame, c)
+		if out != nil {
+			outFrame, _ := el.codec.Encode(c, out)
+			el.eventHandler.PreWrite()
+			_, err = c.conn.Write(outFrame)
+		}
+		switch action {
+		case None:
+		case Close:
+			return el.loopCloseConn(c)
+		case Shutdown:
+			return errors.ErrServerShutdown
+		}
+		if err != nil {
+			return el.loopError(c, err)
+		}
+	}
+	_, _ = c.inboundBuffer.Write(c.buffer.Bytes())
+	bytebuffer.Put(c.buffer)
+	c.buffer = nil
+
+	return
+}
+
+func (el *eventloop) loopCloseConn(c *stdConn) error {
+	return c.conn.SetReadDeadline(time.Now())
+}
+
+func (el *eventloop) loopEgress() {
+	var closed bool
+	for v := range el.ch {
+		switch v := v.(type) {
+		case error:
+			if v == errCloseAllConns {
+				closed = true
+				for c := range el.connections {
+					_ = el.loopCloseConn(c)
+				}
+			}
+		case *stderr:
+			_ = el.loopError(v.c, v.err)
+		}
+		if closed && len(el.connections) == 0 {
+			break
+		}
+	}
+}
+
+func (el *eventloop) loopTicker() {
 	var (
 		delay time.Duration
 		open  bool
 	)
 	for {
-		lp.ch <- func() (err error) {
-			delay, action := lp.eventHandler.Tick()
-			lp.svr.ticktock <- delay
+		el.ch <- func() (err error) {
+			delay, action := el.eventHandler.Tick()
+			el.svr.ticktock <- delay
 			switch action {
 			case Shutdown:
-				err = errClosing
+				err = errors.ErrServerShutdown
 			}
 			return
 		}
-		if delay, open = <-lp.svr.ticktock; open {
+		if delay, open = <-el.svr.ticktock; open {
 			time.Sleep(delay)
 		} else {
 			break
@@ -155,62 +177,59 @@ func (lp *loop) loopTicker() {
 	}
 }
 
-func (lp *loop) loopError(c *stdConn, err error) (e error) {
+func (el *eventloop) loopError(c *stdConn, err error) (e error) {
 	if e = c.conn.Close(); e == nil {
-		delete(lp.connections, c)
-		switch atomic.LoadInt32(&c.done) {
-		case 0: // read error
-			if err != io.EOF {
-				log.Printf("socket: %s with err: %v\n", c.remoteAddr.String(), err)
-			}
-		case 1: // closed
-			log.Printf("socket: %s has been closed by client\n", c.remoteAddr.String())
-		}
-		switch lp.eventHandler.OnClosed(c, err) {
+		delete(el.connections, c)
+		el.calibrateCallback(el, -1)
+		switch el.eventHandler.OnClosed(c, err) {
 		case Shutdown:
-			return errClosing
+			return errors.ErrServerShutdown
 		}
 		c.releaseTCP()
+	} else {
+		el.svr.logger.Warnf("Failed to close connection(%s), error: %v", c.remoteAddr.String(), e)
 	}
+
 	return
 }
 
-func (lp *loop) loopWake(c *stdConn) error {
-	if _, ok := lp.connections[c]; !ok {
-		return nil // ignore stale wakes.
-	}
-	out, action := lp.eventHandler.React(c)
+func (el *eventloop) loopWake(c *stdConn) error {
+	//if co, ok := el.connections[c]; !ok || co != c {
+	//	return nil // ignore stale wakes.
+	//}
+	out, action := el.eventHandler.React(nil, c)
 	if out != nil {
-		_, _ = c.conn.Write(out)
+		frame, _ := el.codec.Encode(c, out)
+		_, _ = c.conn.Write(frame)
 	}
-	c.action = action
-	return lp.handleAction(c)
+
+	return el.handleAction(c, action)
 }
 
-func (lp *loop) handleAction(c *stdConn) error {
-	switch c.action {
+func (el *eventloop) handleAction(c *stdConn, action Action) error {
+	switch action {
 	case None:
 		return nil
 	case Close:
-		return lp.loopClose(c)
+		return el.loopCloseConn(c)
 	case Shutdown:
-		return errShutdown
+		return errors.ErrServerShutdown
 	default:
-		c.action = None
 		return nil
 	}
 }
 
-func (lp *loop) loopReadUDP(c *stdConn) error {
-	out, action := lp.eventHandler.React(c)
+func (el *eventloop) loopReadUDP(c *stdConn) error {
+	out, action := el.eventHandler.React(c.buffer.Bytes(), c)
 	if out != nil {
-		lp.eventHandler.PreWrite()
-		_, _ = lp.svr.ln.pconn.WriteTo(out, c.remoteAddr)
+		el.eventHandler.PreWrite()
+		_, _ = el.svr.ln.pconn.WriteTo(out, c.remoteAddr)
 	}
 	switch action {
 	case Shutdown:
-		return errClosing
+		return errors.ErrServerShutdown
 	}
 	c.releaseUDP()
+
 	return nil
 }

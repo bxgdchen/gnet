@@ -1,31 +1,44 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
-
-// +build linux
+// Copyright (c) 2019 Andy Pan
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
 import "github.com/panjf2000/gnet/internal/netpoll"
 
-func (lp *loop) handleEvent(fd int, ev uint32) error {
-	if c, ok := lp.connections[fd]; ok {
-		switch {
+func (el *eventloop) handleEvent(fd int, ev uint32) error {
+	if c, ok := el.connections[fd]; ok {
+		switch c.outboundBuffer.IsEmpty() {
 		// Don't change the ordering of processing EPOLLOUT | EPOLLRDHUP / EPOLLIN unless you're 100%
 		// sure what you're doing!
 		// Re-ordering can easily introduce bugs and bad side-effects, as I found out painfully in the past.
-		case !c.opened:
-			return lp.loopOpen(c)
-		case !c.outboundBuffer.IsEmpty():
+		case false:
 			if ev&netpoll.OutEvents != 0 {
-				return lp.loopOut(c)
+				return el.loopWrite(c)
 			}
 			return nil
-		case ev&netpoll.InEvents != 0:
-			return lp.loopIn(c)
-		default:
+		case true:
+			if ev&netpoll.InEvents != 0 {
+				return el.loopRead(c)
+			}
 			return nil
 		}
 	}
-	return lp.loopAccept(fd)
+	return el.loopAccept(fd)
 }

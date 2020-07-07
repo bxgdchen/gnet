@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2020 Andy Pan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,34 +18,30 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// +build linux
+// +build darwin
 
-package netpoll
+package reuseport
 
-import "golang.org/x/sys/unix"
+import (
+	"syscall"
 
-const (
-	// InitEvents represents the initial length of poller event-list.
-	InitEvents = 128
-	// ErrEvents represents exceptional events that are not read/write, like socket being closed,
-	// reading/writing from/to a closed socket, etc.
-	ErrEvents = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
-	// OutEvents combines EPOLLOUT event and some exceptional events.
-	OutEvents = ErrEvents | unix.EPOLLOUT
-	// InEvents combines EPOLLIN/EPOLLPRI events and some exceptional events.
-	InEvents = ErrEvents | unix.EPOLLIN | unix.EPOLLPRI
+	"golang.org/x/sys/unix"
 )
 
-type eventList struct {
-	size   int
-	events []unix.EpollEvent
-}
+func sysSocket(family, sotype, proto int) (fd int, err error) {
+	syscall.ForkLock.RLock()
+	if fd, err = unix.Socket(family, sotype, proto); err == nil {
+		unix.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
 
-func newEventList(size int) *eventList {
-	return &eventList{size, make([]unix.EpollEvent, size)}
-}
+	if err != nil {
+		return
+	}
 
-func (el *eventList) increase() {
-	el.size <<= 1
-	el.events = make([]unix.EpollEvent, el.size)
+	if err = unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
+	}
+
+	return
 }

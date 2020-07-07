@@ -1,14 +1,31 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
-// +build linux darwin netbsd freebsd openbsd dragonfly
+// +build linux freebsd dragonfly darwin
 
 package gnet
 
 import (
 	"net"
+	"os"
 
 	"github.com/panjf2000/gnet/internal/netpoll"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
@@ -21,11 +38,10 @@ type conn struct {
 	fd             int                    // file descriptor
 	sa             unix.Sockaddr          // remote socket address
 	ctx            interface{}            // user-defined context
-	loop           *loop                  // connected loop
-	cache          []byte                 // reuse memory of inbound data
+	loop           *eventloop             // connected event-loop
+	buffer         []byte                 // reuse memory of inbound data as a temporary buffer
 	codec          ICodec                 // codec for TCP
 	opened         bool                   // connection opened event fired
-	action         Action                 // next user action
 	localAddr      net.Addr               // local addr
 	remoteAddr     net.Addr               // remote addr
 	byteBuffer     *bytebuffer.ByteBuffer // bytes buffer for buffering current packet and data in ring-buffer
@@ -33,12 +49,12 @@ type conn struct {
 	outboundBuffer *ringbuffer.RingBuffer // buffer for data that is ready to write to client
 }
 
-func newTCPConn(fd int, lp *loop, sa unix.Sockaddr) *conn {
+func newTCPConn(fd int, el *eventloop, sa unix.Sockaddr) *conn {
 	return &conn{
 		fd:             fd,
 		sa:             sa,
-		loop:           lp,
-		codec:          lp.codec,
+		loop:           el,
+		codec:          el.codec,
 		inboundBuffer:  prb.Get(),
 		outboundBuffer: prb.Get(),
 	}
@@ -48,7 +64,7 @@ func (c *conn) releaseTCP() {
 	c.opened = false
 	c.sa = nil
 	c.ctx = nil
-	c.cache = nil
+	c.buffer = nil
 	c.localAddr = nil
 	c.remoteAddr = nil
 	prb.Put(c.inboundBuffer)
@@ -59,19 +75,17 @@ func (c *conn) releaseTCP() {
 	c.byteBuffer = nil
 }
 
-func newUDPConn(fd int, lp *loop, sa unix.Sockaddr, buf []byte) *conn {
+func newUDPConn(fd int, el *eventloop, sa unix.Sockaddr) *conn {
 	return &conn{
 		fd:         fd,
 		sa:         sa,
-		cache:      buf,
-		localAddr:  lp.svr.ln.lnaddr,
+		localAddr:  el.ln.lnaddr,
 		remoteAddr: netpoll.SockaddrToUDPAddr(sa),
 	}
 }
 
 func (c *conn) releaseUDP() {
 	c.ctx = nil
-	c.cache = nil
 	c.localAddr = nil
 	c.remoteAddr = nil
 }
@@ -88,6 +102,10 @@ func (c *conn) open(buf []byte) {
 	}
 }
 
+func (c *conn) read() ([]byte, error) {
+	return c.codec.Decode(c)
+}
+
 func (c *conn) write(buf []byte) {
 	if !c.outboundBuffer.IsEmpty() {
 		_, _ = c.outboundBuffer.Write(buf)
@@ -100,7 +118,7 @@ func (c *conn) write(buf []byte) {
 			_ = c.loop.poller.ModReadWrite(c.fd)
 			return
 		}
-		_ = c.loop.loopCloseConn(c, err)
+		_ = c.loop.loopCloseConn(c, os.NewSyscallError("write", err))
 		return
 	}
 	if n < len(buf) {
@@ -109,99 +127,70 @@ func (c *conn) write(buf []byte) {
 	}
 }
 
-func (c *conn) sendTo(buf []byte) {
-	_ = unix.Sendto(c.fd, buf, 0, c.sa)
+func (c *conn) sendTo(buf []byte) error {
+	return unix.Sendto(c.fd, buf, 0, c.sa)
 }
 
 // ================================= Public APIs of gnet.Conn =================================
 
-func (c *conn) ReadFromUDP() []byte {
-	return c.cache
-}
-
-func (c *conn) ReadFrame() []byte {
-	buf, _ := c.codec.Decode(c)
-	if buf == nil {
-		c.action = Skip
-	}
-	return buf
-}
-
 func (c *conn) Read() []byte {
 	if c.inboundBuffer.IsEmpty() {
-		return c.cache
+		return c.buffer
 	}
-	bytebuffer.Put(c.byteBuffer)
-	c.byteBuffer = c.inboundBuffer.WithByteBuffer(c.cache)
+	c.byteBuffer = c.inboundBuffer.WithByteBuffer(c.buffer)
 	return c.byteBuffer.Bytes()
 }
 
 func (c *conn) ResetBuffer() {
-	c.action = Skip
-	c.cache = c.cache[:0]
+	c.buffer = c.buffer[:0]
 	c.inboundBuffer.Reset()
 	bytebuffer.Put(c.byteBuffer)
 	c.byteBuffer = nil
 }
 
-func (c *conn) ShiftN(n int) (size int) {
-	oneOffBufferLen := len(c.cache)
-	inBufferLen := c.inboundBuffer.Length()
-	if inBufferLen+oneOffBufferLen < n || n <= 0 {
-		c.ResetBuffer()
-		return
-	}
-	size = n
-	if c.inboundBuffer.IsEmpty() {
-		if n == oneOffBufferLen {
-			c.cache = c.cache[:0]
-		} else {
-			c.cache = c.cache[n:]
-		}
-		return
-	}
-	c.byteBuffer.B = c.byteBuffer.B[n:]
-	if c.byteBuffer.Len() == 0 {
-		c.action = Skip
-		bytebuffer.Put(c.byteBuffer)
-		c.byteBuffer = nil
-	}
-	if inBufferLen >= n {
-		c.inboundBuffer.Shift(n)
-		return
-	}
-	c.inboundBuffer.Reset()
-
-	restSize := n - inBufferLen
-	if restSize == oneOffBufferLen {
-		c.cache = c.cache[:0]
-	} else {
-		c.cache = c.cache[restSize:]
-	}
-	return
-}
-
 func (c *conn) ReadN(n int) (size int, buf []byte) {
-	oneOffBufferLen := len(c.cache)
 	inBufferLen := c.inboundBuffer.Length()
-	if inBufferLen+oneOffBufferLen < n || n <= 0 {
-		c.action = Skip
+	tempBufferLen := len(c.buffer)
+	if totalLen := inBufferLen + tempBufferLen; totalLen < n || n <= 0 {
+		n = totalLen
+	}
+	size = n
+	if c.inboundBuffer.IsEmpty() {
+		buf = c.buffer[:n]
+		return
+	}
+	head, tail := c.inboundBuffer.LazyRead(n)
+	c.byteBuffer = bytebuffer.Get()
+	_, _ = c.byteBuffer.Write(head)
+	_, _ = c.byteBuffer.Write(tail)
+	if inBufferLen >= n {
+		buf = c.byteBuffer.Bytes()
+		return
+	}
+
+	restSize := n - inBufferLen
+	_, _ = c.byteBuffer.Write(c.buffer[:restSize])
+	buf = c.byteBuffer.Bytes()
+	return
+}
+
+func (c *conn) ShiftN(n int) (size int) {
+	inBufferLen := c.inboundBuffer.Length()
+	tempBufferLen := len(c.buffer)
+	if inBufferLen+tempBufferLen < n || n <= 0 {
+		c.ResetBuffer()
+		size = inBufferLen + tempBufferLen
 		return
 	}
 	size = n
 	if c.inboundBuffer.IsEmpty() {
-		buf = c.cache[:n]
-		if n == oneOffBufferLen {
-			c.cache = c.cache[:0]
-		} else {
-			c.cache = c.cache[n:]
-		}
+		c.buffer = c.buffer[n:]
 		return
 	}
-	buf, tail := c.inboundBuffer.LazyRead(n)
-	if tail != nil {
-		buf = append(buf, tail...)
-	}
+
+	bytebuffer.Put(c.byteBuffer)
+	c.byteBuffer = nil
+
 	if inBufferLen >= n {
 		c.inboundBuffer.Shift(n)
 		return
@@ -209,42 +198,40 @@ func (c *conn) ReadN(n int) (size int, buf []byte) {
 	c.inboundBuffer.Reset()
 
 	restSize := n - inBufferLen
-	buf = append(buf, c.cache[:restSize]...)
-	if restSize == oneOffBufferLen {
-		c.cache = c.cache[:0]
-		c.action = Skip
-	} else {
-		c.cache = c.cache[restSize:]
-	}
+	c.buffer = c.buffer[restSize:]
 	return
 }
-
-//func (c *conn) InboundBuffer() *ringbuffer.RingBuffer {
-//	return c.inboundBuffer
-//}
 
 func (c *conn) BufferLength() int {
-	return c.inboundBuffer.Length() + len(c.cache)
+	return c.inboundBuffer.Length() + len(c.buffer)
 }
 
-func (c *conn) AsyncWrite(buf []byte) {
-	if encodedBuf, err := c.codec.Encode(c, buf); err == nil {
-		_ = c.loop.poller.Trigger(func() error {
+func (c *conn) AsyncWrite(buf []byte) (err error) {
+	var encodedBuf []byte
+	if encodedBuf, err = c.codec.Encode(c, buf); err == nil {
+		return c.loop.poller.Trigger(func() error {
 			if c.opened {
 				c.write(encodedBuf)
 			}
 			return nil
 		})
 	}
+	return
 }
 
-func (c *conn) SendTo(buf []byte) {
-	c.sendTo(buf)
+func (c *conn) SendTo(buf []byte) error {
+	return c.sendTo(buf)
 }
 
-func (c *conn) Wake() {
-	_ = c.loop.poller.Trigger(func() error {
+func (c *conn) Wake() error {
+	return c.loop.poller.Trigger(func() error {
 		return c.loop.loopWake(c)
+	})
+}
+
+func (c *conn) Close() error {
+	return c.loop.poller.Trigger(func() error {
+		return c.loop.loopCloseConn(c, nil)
 	})
 }
 

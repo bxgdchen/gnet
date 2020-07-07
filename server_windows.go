@@ -1,18 +1,37 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
-
-// +build windows
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
 import (
 	"errors"
-	"log"
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
+
+	errors2 "github.com/panjf2000/gnet/errors"
+	"github.com/panjf2000/gnet/internal/logging"
 )
 
 // commandBufferSize represents the buffer size of event-loop command channel on Windows.
@@ -20,25 +39,21 @@ const (
 	commandBufferSize = 512
 )
 
-var (
-	errClosing    = errors.New("closing")
-	errCloseConns = errors.New("close conns")
-)
+var errCloseAllConns = errors.New("close all connections in event-loop")
 
 type server struct {
-	ln               *listener          // all the listeners
-	cond             *sync.Cond         // shutdown signaler
-	opts             *Options           // options with server
-	serr             error              // signal error
-	once             sync.Once          // make sure only signalShutdown once
-	codec            ICodec             // codec for TCP stream
-	loops            []*loop            // all the loops
-	loopWG           sync.WaitGroup     // loop close WaitGroup
-	ticktock         chan time.Duration // ticker channel
-	listenerWG       sync.WaitGroup     // listener close WaitGroup
-	eventHandler     EventHandler       // user eventHandler
-	subLoopGroup     IEventLoopGroup    // loops for handling events
-	subLoopGroupSize int                // number of loops
+	ln              *listener          // all the listeners
+	cond            *sync.Cond         // shutdown signaler
+	opts            *Options           // options with server
+	serr            error              // signal error
+	once            sync.Once          // make sure only signalShutdown once
+	codec           ICodec             // codec for TCP stream
+	loopWG          sync.WaitGroup     // loop close WaitGroup
+	logger          logging.Logger     // customized logger for logging info
+	ticktock        chan time.Duration // ticker channel
+	listenerWG      sync.WaitGroup     // listener close WaitGroup
+	eventHandler    EventHandler       // user eventHandler
+	subEventLoopSet loadBalancer       // event-loops for handling events
 }
 
 // waitForShutdown waits for a signal to shutdown.
@@ -68,37 +83,37 @@ func (svr *server) startListener() {
 	}()
 }
 
-func (svr *server) startLoops(numLoops int) {
-	for i := 0; i < numLoops; i++ {
-		lp := &loop{
-			ch:           make(chan interface{}, commandBufferSize),
-			idx:          i,
-			svr:          svr,
-			codec:        svr.codec,
-			connections:  make(map[*stdConn]bool),
-			eventHandler: svr.eventHandler,
+func (svr *server) startEventLoops(numEventLoop int) {
+	for i := 0; i < numEventLoop; i++ {
+		el := &eventloop{
+			ch:                make(chan interface{}, commandBufferSize),
+			svr:               svr,
+			codec:             svr.codec,
+			connections:       make(map[*stdConn]struct{}),
+			eventHandler:      svr.eventHandler,
+			calibrateCallback: svr.subEventLoopSet.calibrate,
 		}
-		svr.subLoopGroup.register(lp)
+		svr.subEventLoopSet.register(el)
 	}
-	svr.subLoopGroupSize = svr.subLoopGroup.len()
-	svr.loopWG.Add(svr.subLoopGroupSize)
-	svr.subLoopGroup.iterate(func(i int, lp *loop) bool {
-		go lp.loopRun()
+
+	svr.loopWG.Add(svr.subEventLoopSet.len())
+	svr.subEventLoopSet.iterate(func(i int, el *eventloop) bool {
+		go el.loopRun()
 		return true
 	})
 }
 
 func (svr *server) stop() {
 	// Wait on a signal for shutdown.
-	log.Printf("server is being shutdown with err: %v\n", svr.waitForShutdown())
+	svr.logger.Infof("Server is being shutdown on the signal error: %v", svr.waitForShutdown())
 
 	// Close listener.
 	svr.ln.close()
 	svr.listenerWG.Wait()
 
 	// Notify all loops to close.
-	svr.subLoopGroup.iterate(func(i int, lp *loop) bool {
-		lp.ch <- errClosing
+	svr.subEventLoopSet.iterate(func(i int, el *eventloop) bool {
+		el.ch <- errors2.ErrServerShutdown
 		return true
 	})
 
@@ -106,31 +121,41 @@ func (svr *server) stop() {
 	svr.loopWG.Wait()
 
 	// Close all connections.
-	svr.loopWG.Add(svr.subLoopGroupSize)
-	svr.subLoopGroup.iterate(func(i int, lp *loop) bool {
-		lp.ch <- errCloseConns
+	svr.loopWG.Add(svr.subEventLoopSet.len())
+	svr.subEventLoopSet.iterate(func(i int, el *eventloop) bool {
+		el.ch <- errCloseAllConns
 		return true
 	})
 	svr.loopWG.Wait()
-	return
 }
 
 func serve(eventHandler EventHandler, listener *listener, options *Options) (err error) {
 	// Figure out the correct number of loops/goroutines to use.
-	var numCPU int
+	numEventLoop := 1
 	if options.Multicore {
-		numCPU = runtime.NumCPU()
-	} else {
-		numCPU = 1
+		numEventLoop = runtime.NumCPU()
+	}
+	if options.NumEventLoop > 0 {
+		numEventLoop = options.NumEventLoop
 	}
 
 	svr := new(server)
 	svr.opts = options
 	svr.eventHandler = eventHandler
 	svr.ln = listener
-	svr.subLoopGroup = new(eventLoopGroup)
+
+	switch options.LB {
+	case RoundRobin:
+		svr.subEventLoopSet = new(roundRobinEventLoopSet)
+	case LeastConnections:
+		svr.subEventLoopSet = new(leastConnectionsEventLoopSet)
+	case SourceAddrHash:
+		svr.subEventLoopSet = new(sourceAddrHashEventLoopSet)
+	}
+
 	svr.ticktock = make(chan time.Duration, 1)
 	svr.cond = sync.NewCond(&sync.Mutex{})
+	svr.logger = logging.DefaultLogger
 	svr.codec = func() ICodec {
 		if options.Codec == nil {
 			return new(BuiltInFrameCodec)
@@ -139,10 +164,11 @@ func serve(eventHandler EventHandler, listener *listener, options *Options) (err
 	}()
 
 	server := Server{
+		svr:          svr,
 		Multicore:    options.Multicore,
 		Addr:         listener.lnaddr,
-		NumLoops:     numCPU,
-		ReUsePort:    options.ReusePort,
+		NumEventLoop: numEventLoop,
+		ReusePort:    options.ReusePort,
 		TCPKeepAlive: options.TCPKeepAlive,
 	}
 	switch svr.eventHandler.OnInitComplete(server) {
@@ -150,11 +176,25 @@ func serve(eventHandler EventHandler, listener *listener, options *Options) (err
 	case Shutdown:
 		return
 	}
+	defer svr.eventHandler.OnShutdown(server)
 
-	// Start all loops.
-	svr.startLoops(numCPU)
-	// Start listener.
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer close(shutdown)
+
+	go func() {
+		if <-shutdown == nil {
+			return
+		}
+		svr.signalShutdown(errors.New("caught OS signal"))
+	}()
+
+	// Start all event-loops in background.
+	svr.startEventLoops(numEventLoop)
+
+	// Start listener in background.
 	svr.startListener()
+
 	defer svr.stop()
 
 	return
