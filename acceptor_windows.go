@@ -1,81 +1,68 @@
 // Copyright (c) 2019 Andy Pan
 // Copyright (c) 2018 Joshua J Baker
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package gnet
 
 import (
-	"hash/crc32"
+	"runtime"
 	"time"
-
-	"github.com/panjf2000/gnet/pool/bytebuffer"
 )
 
-// hashCode hashes a string to a unique hashcode.
-func hashCode(s string) int {
-	v := int(crc32.ChecksumIEEE([]byte(s)))
-	if v >= 0 {
-		return v
+func (svr *server) listenerRun(lockOSThread bool) {
+	if lockOSThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 	}
-	return -v
-}
 
-func (svr *server) listenerRun() {
 	var err error
-	defer func() { svr.signalShutdown(err) }()
-	var packet [0x10000]byte
+	defer func() { svr.signalShutdownWithErr(err) }()
+	var buffer [0x10000]byte
 	for {
-		if svr.ln.pconn != nil {
+		if svr.ln.packetConn != nil {
 			// Read data from UDP socket.
-			n, addr, e := svr.ln.pconn.ReadFrom(packet[:])
+			n, addr, e := svr.ln.packetConn.ReadFrom(buffer[:])
 			if e != nil {
 				err = e
+				svr.opts.Logger.Errorf("failed to receive data from UDP fd due to error:%v", err)
 				return
 			}
-			buf := bytebuffer.Get()
-			_, _ = buf.Write(packet[:n])
 
-			el := svr.subEventLoopSet.next(hashCode(addr.String()))
-			el.ch <- &udpIn{newUDPConn(el, svr.ln.lnaddr, addr, buf)}
+			el := svr.lb.next(addr)
+			c := newUDPConn(el, svr.ln.addr, addr)
+			el.ch <- packUDPConn(c, buffer[:n])
 		} else {
 			// Accept TCP socket.
 			conn, e := svr.ln.ln.Accept()
 			if e != nil {
 				err = e
+				svr.opts.Logger.Errorf("Accept() fails due to error: %v", err)
 				return
 			}
-			el := svr.subEventLoopSet.next(hashCode(conn.RemoteAddr().String()))
+			el := svr.lb.next(conn.RemoteAddr())
 			c := newTCPConn(conn, el)
 			el.ch <- c
 			go func() {
-				var packet [0x10000]byte
+				var buffer [0x10000]byte
 				for {
-					n, err := c.conn.Read(packet[:])
+					n, err := conn.Read(buffer[:])
 					if err != nil {
-						_ = c.conn.SetReadDeadline(time.Time{})
+						_ = conn.SetReadDeadline(time.Time{})
 						el.ch <- &stderr{c, err}
 						return
 					}
-					buf := bytebuffer.Get()
-					_, _ = buf.Write(packet[:n])
-					el.ch <- &tcpIn{c, buf}
+					el.ch <- packTCPConn(c, buffer[:n])
 				}
 			}()
 		}

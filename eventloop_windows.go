@@ -1,140 +1,145 @@
 // Copyright (c) 2019 Andy Pan
 // Copyright (c) 2018 Joshua J Baker
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package gnet
 
 import (
-	"net"
+	"context"
+	"runtime"
+	"sync/atomic"
 	"time"
 
-	"github.com/panjf2000/gnet/errors"
-	"github.com/panjf2000/gnet/pool/bytebuffer"
+	"github.com/panjf2000/gnet/pkg/errors"
+	"github.com/panjf2000/gnet/pkg/logging"
+	bbPool "github.com/panjf2000/gnet/pkg/pool/bytebuffer"
 )
 
 type eventloop struct {
-	ch                chan interface{}        // command channel
-	idx               int                     // loop index
-	svr               *server                 // server in loop
-	codec             ICodec                  // codec for TCP
-	connCount         int32                   // number of active connections in event-loop
-	connections       map[*stdConn]struct{}   // track all the sockets bound to this loop
-	eventHandler      EventHandler            // user eventHandler
-	calibrateCallback func(*eventloop, int32) // callback func for re-adjusting connCount
+	ch           chan interface{}      // command channel
+	idx          int                   // loop index
+	svr          *server               // server in loop
+	connCount    int32                 // number of active connections in event-loop
+	connections  map[*stdConn]struct{} // track all the sockets bound to this loop
+	eventHandler EventHandler          // user eventHandler
 }
 
-func (el *eventloop) loopRun() {
+func (el *eventloop) getLogger() logging.Logger {
+	return el.svr.opts.Logger
+}
+
+func (el *eventloop) addConn(delta int32) {
+	atomic.AddInt32(&el.connCount, delta)
+}
+
+func (el *eventloop) loadConn() int32 {
+	return atomic.LoadInt32(&el.connCount)
+}
+
+func (el *eventloop) run(lockOSThread bool) {
+	if lockOSThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
 	var err error
 	defer func() {
-		if el.idx == 0 && el.svr.opts.Ticker {
-			close(el.svr.ticktock)
-		}
-		el.svr.signalShutdown(err)
+		el.svr.signalShutdownWithErr(err)
 		el.svr.loopWG.Done()
-		el.loopEgress()
+		el.egress()
 		el.svr.loopWG.Done()
 	}()
 
-	if el.idx == 0 && el.svr.opts.Ticker {
-		go el.loopTicker()
-	}
-
-	for v := range el.ch {
-		switch v := v.(type) {
+	for i := range el.ch {
+		switch v := i.(type) {
 		case error:
 			err = v
 		case *stdConn:
-			err = el.loopAccept(v)
-		case *tcpIn:
-			err = el.loopRead(v)
-		case *udpIn:
-			err = el.loopReadUDP(v.c)
+			err = el.accept(v)
+		case *tcpConn:
+			if v.c.conn == nil {
+				err = errors.ErrConnectionClosed
+				break
+			}
+			v.c.buffer = v.bb
+			err = el.read(v.c)
+		case *udpConn:
+			err = el.readUDP(v.c)
 		case *stderr:
-			err = el.loopError(v.c, v.err)
-		case wakeReq:
-			err = el.loopWake(v.c)
-		case func() error:
-			err = v()
+			err = el.error(v.c, v.err)
+		case *signalTask:
+			err = v.run(v.c)
+			signalTaskPool.Put(i)
+		case *dataTask:
+			_, err = v.run(v.buf)
+			dataTaskPool.Put(i)
 		}
-		if err != nil {
-			el.svr.logger.Infof("Event-loop(%d) is exiting due to an unexpected error: %v", el.idx, err)
+
+		if err == errors.ErrServerShutdown {
+			el.getLogger().Debugf("event-loop(%d) is exiting in terms of the demand from user, %v", el.idx, err)
 			break
+		} else if err != nil {
+			el.getLogger().Debugf("event-loop(%d) got a nonlethal error: %v", el.idx, err)
 		}
 	}
 }
 
-func (el *eventloop) loopAccept(c *stdConn) error {
+func (el *eventloop) accept(c *stdConn) error {
 	el.connections[c] = struct{}{}
-	c.localAddr = el.svr.ln.lnaddr
-	c.remoteAddr = c.conn.RemoteAddr()
-	el.calibrateCallback(el, 1)
-	if el.svr.opts.TCPKeepAlive > 0 {
-		if c, ok := c.conn.(*net.TCPConn); ok {
-			_ = c.SetKeepAlive(true)
-			_ = c.SetKeepAlivePeriod(el.svr.opts.TCPKeepAlive)
-		}
-	}
+	el.addConn(1)
 
 	out, action := el.eventHandler.OnOpened(c)
 	if out != nil {
-		el.eventHandler.PreWrite()
+		el.eventHandler.PreWrite(c)
 		_, _ = c.conn.Write(out)
+		el.eventHandler.AfterWrite(c, out)
 	}
 
 	return el.handleAction(c, action)
 }
 
-func (el *eventloop) loopRead(ti *tcpIn) (err error) {
-	c := ti.c
-	c.buffer = ti.in
-
+func (el *eventloop) read(c *stdConn) error {
 	for inFrame, _ := c.read(); inFrame != nil; inFrame, _ = c.read() {
 		out, action := el.eventHandler.React(inFrame, c)
 		if out != nil {
-			outFrame, _ := el.codec.Encode(c, out)
-			el.eventHandler.PreWrite()
-			_, err = c.conn.Write(outFrame)
+			if _, err := c.write(out); err != nil {
+				return el.error(c, err)
+			}
 		}
 		switch action {
 		case None:
 		case Close:
-			return el.loopCloseConn(c)
+			return el.closeConn(c)
 		case Shutdown:
 			return errors.ErrServerShutdown
 		}
-		if err != nil {
-			return el.loopError(c, err)
-		}
 	}
-	_, _ = c.inboundBuffer.Write(c.buffer.Bytes())
-	bytebuffer.Put(c.buffer)
+	_, _ = c.inboundBuffer.Write(c.buffer.B)
+	bbPool.Put(c.buffer)
 	c.buffer = nil
 
-	return
+	return nil
 }
 
-func (el *eventloop) loopCloseConn(c *stdConn) error {
-	return c.conn.SetReadDeadline(time.Now())
+func (el *eventloop) closeConn(c *stdConn) error {
+	if c.conn != nil {
+		return c.conn.SetReadDeadline(time.Now())
+	}
+	return nil
 }
 
-func (el *eventloop) loopEgress() {
+func (el *eventloop) egress() {
 	var closed bool
 	for v := range el.ch {
 		switch v := v.(type) {
@@ -142,11 +147,11 @@ func (el *eventloop) loopEgress() {
 			if v == errCloseAllConns {
 				closed = true
 				for c := range el.connections {
-					_ = el.loopCloseConn(c)
+					_ = el.closeConn(c)
 				}
 			}
 		case *stderr:
-			_ = el.loopError(v.c, v.err)
+			_ = el.error(v.c, v.err)
 		}
 		if closed && len(el.connections) == 0 {
 			break
@@ -154,53 +159,75 @@ func (el *eventloop) loopEgress() {
 	}
 }
 
-func (el *eventloop) loopTicker() {
+func (el *eventloop) ticker(ctx context.Context) {
+	if el == nil {
+		return
+	}
 	var (
-		delay time.Duration
-		open  bool
+		action Action
+		delay  time.Duration
+		timer  *time.Timer
 	)
-	for {
-		el.ch <- func() (err error) {
-			delay, action := el.eventHandler.Tick()
-			el.svr.ticktock <- delay
-			switch action {
-			case Shutdown:
-				err = errors.ErrServerShutdown
-			}
-			return
+	defer func() {
+		if timer != nil {
+			timer.Stop()
 		}
-		if delay, open = <-el.svr.ticktock; open {
-			time.Sleep(delay)
+	}()
+	for {
+		delay, action = el.eventHandler.Tick()
+		if action == Shutdown {
+			el.ch <- errors.ErrServerShutdown
+			el.getLogger().Debugf("stopping ticker in event-loop(%d) from Tick()", el.idx)
+		}
+		if timer == nil {
+			timer = time.NewTimer(delay)
 		} else {
-			break
+			timer.Reset(delay)
+		}
+		select {
+		case <-ctx.Done():
+			el.getLogger().Debugf("stopping ticker in event-loop(%d) from Server, error:%v", el.idx, ctx.Err())
+			return
+		case <-timer.C:
 		}
 	}
 }
 
-func (el *eventloop) loopError(c *stdConn, err error) (e error) {
-	if e = c.conn.Close(); e == nil {
-		delete(el.connections, c)
-		el.calibrateCallback(el, -1)
-		switch el.eventHandler.OnClosed(c, err) {
-		case Shutdown:
-			return errors.ErrServerShutdown
+func (el *eventloop) error(c *stdConn, err error) (e error) {
+	defer func() {
+		if _, ok := el.connections[c]; !ok {
+			return // ignore stale wakes.
 		}
+
+		if err = c.conn.Close(); err != nil {
+			el.getLogger().Errorf("failed to close connection(%s), error: %v", c.remoteAddr.String(), err)
+			if e == nil {
+				e = err
+			}
+		}
+		delete(el.connections, c)
+		el.addConn(-1)
+
 		c.releaseTCP()
-	} else {
-		el.svr.logger.Warnf("Failed to close connection(%s), error: %v", c.remoteAddr.String(), e)
+	}()
+
+	if el.eventHandler.OnClosed(c, err) == Shutdown {
+		return errors.ErrServerShutdown
 	}
 
 	return
 }
 
-func (el *eventloop) loopWake(c *stdConn) error {
-	//if co, ok := el.connections[c]; !ok || co != c {
-	//	return nil // ignore stale wakes.
-	//}
+func (el *eventloop) wake(c *stdConn) error {
+	if _, ok := el.connections[c]; !ok {
+		return nil // ignore stale wakes.
+	}
+
 	out, action := el.eventHandler.React(nil, c)
 	if out != nil {
-		frame, _ := el.codec.Encode(c, out)
-		_, _ = c.conn.Write(frame)
+		if _, err := c.write(out); err != nil {
+			return err
+		}
 	}
 
 	return el.handleAction(c, action)
@@ -211,7 +238,7 @@ func (el *eventloop) handleAction(c *stdConn, action Action) error {
 	case None:
 		return nil
 	case Close:
-		return el.loopCloseConn(c)
+		return el.closeConn(c)
 	case Shutdown:
 		return errors.ErrServerShutdown
 	default:
@@ -219,14 +246,12 @@ func (el *eventloop) handleAction(c *stdConn, action Action) error {
 	}
 }
 
-func (el *eventloop) loopReadUDP(c *stdConn) error {
+func (el *eventloop) readUDP(c *stdConn) error {
 	out, action := el.eventHandler.React(c.buffer.Bytes(), c)
 	if out != nil {
-		el.eventHandler.PreWrite()
-		_, _ = el.svr.ln.pconn.WriteTo(out, c.remoteAddr)
+		_ = c.SendTo(out)
 	}
-	switch action {
-	case Shutdown:
+	if action == Shutdown {
 		return errors.ErrServerShutdown
 	}
 	c.releaseUDP()
